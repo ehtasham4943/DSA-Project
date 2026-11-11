@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StructureCheck – AST-based plagiarism detector</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1c2430; --muted:#5d6b7c; --line:#dde2e9; --accent:#2f6fed; --bad:#d93b3b; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#12161c; --card:#1b212a; --text:#e6ebf2; --muted:#93a1b3; --line:#2b3441; --accent:#6c9cff; --bad:#ff6b6b; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--text); line-height:1.5; }
+  header { padding:28px 20px 8px; max-width:1100px; margin:0 auto; }
+  h1 { margin:0 0 4px; font-size:26px; } h2 { font-size:17px; margin:0 0 10px; }
+  .sub { color:var(--muted); margin:0; }
+  main { max-width:1100px; margin:0 auto; padding:12px 20px 60px; display:grid; gap:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  button, .btn { background:var(--accent); color:#fff; border:0; padding:8px 14px; border-radius:8px; cursor:pointer; font-size:14px; }
+  button.ghost { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  input[type=text], textarea, select { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:8px; font-family:inherit; font-size:14px; }
+  textarea { width:100%; min-height:140px; font-family: ui-monospace, Consolas, monospace; font-size:13px; }
+  .chips { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+  .chip { background:var(--bg); border:1px solid var(--line); border-radius:999px; padding:3px 10px; font-size:13px; }
+  .chip b { cursor:pointer; margin-left:6px; color:var(--bad); }
+  table { border-collapse:collapse; font-size:13px; } td, th { padding:6px 8px; border:1px solid var(--line); text-align:center; }
+  th { font-weight:600; } .wrap { overflow-x:auto; }
+  .bar { height:10px; border-radius:5px; background:var(--accent); } .barbg { background:var(--line); border-radius:5px; width:160px; }
+  .flag { color:var(--bad); font-weight:700; }
+  pre { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:10px; max-height:360px; overflow:auto; font-size:12px; }
+  .muted { color:var(--muted); font-size:13px; } .err { color:var(--bad); font-size:13px; }
+  svg text { fill: var(--text); font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>StructureCheck</h1>
+  <p class="sub">Structure-based copy detector for C++ and Python. Renaming variables, changing comments or spacing, <code>for</code>↔<code>while</code>, <code>a+b</code>↔<code>b+a</code> and reordering statements do not hide a copy. Runs fully in your browser — nothing is uploaded.</p>
+</header>
+<main>
+  <section class="card">
+    <h2>1. Add code</h2>
+    <div class="row">
+      <label class="btn">Select .cpp / .py files<input id="files" type="file" multiple accept=".cpp,.cc,.cxx,.py,.txt" hidden></label>
+      <button class="ghost" id="clear">Clear all</button>
+    </div>
+    <p class="muted" style="margin:10px 0 6px">…or paste a code block (use a name ending in <code>.cpp</code> or <code>.py</code>):</p>
+    <div class="row"><input type="text" id="pname" placeholder="student3.cpp" value="pasted1.cpp"><button id="padd">Add pasted code</button></div>
+    <textarea id="ptext" placeholder="#include &lt;iostream&gt;&#10;int main() { ... }" style="margin-top:8px"></textarea>
+    <div class="chips" id="chips"></div>
+  </section>
+
+  <section class="card">
+    <h2>2. Settings</h2>
+    <div class="row">
+      <label>Flag threshold: <b id="thv">70%</b> <input type="range" id="th" min="30" max="100" value="70"></label>
+      <label>Min subtree size: <input type="number" id="ms" min="2" max="20" value="4" style="width:60px"></label>
+    </div>
+    <p class="muted">Similarity score S = 2|M| / (|T1| + |T2|), where M is the set of matching normalized subtrees. It is evidence only — the instructor decides.</p>
+  </section>
+
+  <section class="card" id="out" hidden>
+    <h2>3. Results</h2>
+    <div id="errs"></div>
+    <h2 style="margin-top:14px">Similarity heat-map</h2><div class="wrap" id="heat"></div>
+    <h2 style="margin-top:18px">Most similar pairs</h2><div class="wrap" id="pairs"></div>
+    <h2 style="margin-top:18px">Clusters (graph + DFS)</h2><div id="graph"></div><p class="muted" id="clist"></p>
+  </section>
+
+  <section class="card" id="astcard" hidden>
+    <h2>Normalized syntax tree</h2>
+    <div class="row"><select id="astsel"></select><span class="muted">identifiers → roles, literals → type tags, comments removed</span></div>
+    <pre id="ast"></pre>
+  </section>
+
+  <section class="card">
+    <h2>About</h2>
+    <p class="muted">Part of the StructureCheck project. The C++ program (<code>main.cpp</code>) does the grading (compiles and runs test cases) and the same structural plagiarism check as this page. C++ is parsed with a real parser; Python uses an indentation-based statement tree (a lighter check).</p>
+  </section>
+</main>
+<script>
+// StructureCheck (browser/Node port): normalized-AST plagiarism detector for C++ and Python.
+// Same idea as the C++ tool: normalize -> hash every subtree -> hash-table match -> S = 2|M|/(|T1|+|T2|) -> DFS clusters.
+(function (root) {
+  "use strict";
+
+  // ---------- hashing ----------
+  function h53(str, seed = 0) {
+    let h1 = 0xdeadbeef ^ seed, h2 = 0x41c6ce57 ^ seed;
+    for (let i = 0; i < str.length; i++) {
+      const ch = str.charCodeAt(i);
+      h1 = Math.imul(h1 ^ ch, 2654435761); h2 = Math.imul(h2 ^ ch, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return 4294967296 * (2097151 & h2) + (h1 >>> 0);
+  }
+  function finalize(n) {
+    n.size = 1; let s = n.label + "(";
+    for (const k of n.kids) { s += k.hash + ","; n.size += k.size; }
+    n.hash = h53(s + ")");
+    return n;
+  }
+  const mk = (label, kids = []) => finalize({ label, kids, hash: 0, size: 1 });
+
+  // ---------- C++ lexer ----------
+  function lexCpp(s) {
+    const raw = []; let i = 0; const n = s.length; let ls = true;
+    const ops = ["<<=", ">>=", "->", "++", "--", "<<", ">>", "<=", ">=", "==", "!=", "&&", "||", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "::"];
+    while (i < n) {
+      const c = s[i];
+      if (c === "\n") { ls = true; i++; continue; }
+      if (/\s/.test(c)) { i++; continue; }
+      if (c === "#" && ls) { while (i < n && s[i] !== "\n") { if (s[i] === "\\" && i + 1 < n) i++; i++; } continue; }
+      ls = false;
+      if (c === "/" && s[i + 1] === "/") { while (i < n && s[i] !== "\n") i++; continue; }
+      if (c === "/" && s[i + 1] === "*") { i += 2; while (i + 1 < n && !(s[i] === "*" && s[i + 1] === "/")) i++; i += 2; continue; }
+      if (/[A-Za-z_]/.test(c)) { let j = i; while (j < n && /[A-Za-z0-9_]/.test(s[j])) j++; raw.push({ t: "ID", x: s.slice(i, j) }); i = j; continue; }
+      if (/[0-9]/.test(c) || (c === "." && /[0-9]/.test(s[i + 1] || ""))) {
+        let j = i; while (j < n && (/[A-Za-z0-9.]/.test(s[j]) || ((s[j] === "+" || s[j] === "-") && j > i && /[eE]/.test(s[j - 1])))) j++;
+        raw.push({ t: "NUM", x: s.slice(i, j) }); i = j; continue;
+      }
+      if (c === '"' || c === "'") { let j = i + 1; while (j < n && s[j] !== c) { if (s[j] === "\\") j++; j++; } raw.push({ t: c === '"' ? "STR" : "CHR", x: "" }); i = j + 1; continue; }
+      let op = c; for (const o of ops) if (s.startsWith(o, i)) { op = o; break; }
+      raw.push({ t: "OP", x: op }); i += op.length;
+    }
+    const out = [];
+    for (let k = 0; k < raw.length; k++) {
+      if (raw[k].t === "ID" && raw[k].x === "std" && raw[k + 1] && raw[k + 1].x === "::") { k++; continue; }
+      out.push(raw[k]);
+    }
+    out.push({ t: "END", x: "" });
+    return out;
+  }
+
+  // ---------- C++ parser (recursive descent, shunting-yard for binary operators) ----------
+  const TYPE_KW = ["int", "long", "short", "char", "bool", "float", "double", "void", "auto", "unsigned", "signed", "const", "static",
+    "string", "vector", "size_t", "map", "set", "queue", "stack", "pair", "unordered_map", "unordered_set"];
+  const STREAM = ["cout", "cin", "cerr", "endl", "NULL", "nullptr"];
+  const STDFN = ["printf", "scanf", "puts", "getline", "sort", "min", "max", "abs", "swap", "sqrt", "pow", "sizeof", "push_back", "pop_back", "size", "empty",
+    "begin", "end", "front", "back", "top", "pop", "push", "insert", "erase", "find", "count", "clear", "reverse", "length", "substr", "main"];
+  const PREC = { "*": 13, "/": 13, "%": 13, "+": 12, "-": 12, "<<": 11, ">>": 11, "<": 10, "<=": 10, ">": 10, ">=": 10, "==": 9, "!=": 9, "&": 8, "^": 7, "|": 6, "&&": 5, "||": 4 };
+
+  class CppParser {
+    constructor(src) { this.t = lexCpp(src); this.p = 0; this.user = []; }
+    cur() { return this.t[this.p]; }
+    isOp(s) { const c = this.cur(); return c.t === "OP" && c.x === s; }
+    isId(s) { const c = this.cur(); return c.t === "ID" && c.x === s; }
+    accept(s) { if (this.isOp(s)) { this.p++; return true; } return false; }
+    fail(m) { throw new Error("unsupported syntax (" + m + ") near '" + this.cur().x + "' token #" + this.p); }
+    expect(s) { if (!this.accept(s)) this.fail("expected '" + s + "'"); }
+    isTypeName(s) { return TYPE_KW.includes(s) || this.user.includes(s); }
+    isDeclStart() {
+      const c = this.cur(); if (c.t !== "ID") return false;
+      if (TYPE_KW.includes(c.x)) return true;
+      if (this.user.includes(c.x)) { const n = this.t[this.p + 1]; return n.t === "ID" || n.x === "*" || n.x === "&" || n.x === "<"; }
+      return false;
+    }
+    wrapBlock(s) {
+      if (s.label === "splice") { s.label = "block"; return finalize(s); }
+      return s.label === "block" ? s : mk("block", [s]);
+    }
+    parseType() {
+      let lab = "type:", any = false;
+      while (this.cur().t === "ID" && this.isTypeName(this.cur().x)) { lab += (this.user.includes(this.cur().x) ? "UT" : this.cur().x) + " "; this.p++; any = true; }
+      if (!any) this.fail("expected type");
+      if (this.isOp("<")) {
+        let depth = 0;
+        do {
+          if (this.isOp("<")) depth++; else if (this.isOp(">")) depth--; else if (this.isOp(">>")) depth -= 2;
+          else if (this.cur().t === "END") this.fail("unterminated template");
+          else if (this.cur().t === "ID") lab += this.user.includes(this.cur().x) ? "UT" : this.cur().x;
+          this.p++;
+        } while (depth > 0);
+        lab += "<>";
+      }
+      while (this.isOp("*") || this.isOp("&") || this.isOp("&&") || this.isId("const")) { lab += this.cur().x; this.p++; }
+      return mk(lab);
+    }
+    parseInitializer() {
+      if (this.accept("{")) {
+        const k = []; while (!this.isOp("}")) { k.push(this.parseExpr()); if (!this.accept(",")) break; }
+        this.expect("}"); return mk("initlist", k);
+      }
+      return this.parseExpr();
+    }
+    parseDeclarators(ty) {
+      const kids = [ty];
+      do {
+        while (this.accept("*") || this.accept("&")) { }
+        if (this.cur().t !== "ID") this.fail("expected name");
+        this.p++; const dk = [];
+        while (this.accept("[")) { if (!this.isOp("]")) dk.push(this.parseExpr()); this.expect("]"); dk.push(mk("dim")); }
+        if (this.accept("=")) dk.push(this.parseInitializer());
+        else if (this.isOp("{")) dk.push(this.parseInitializer());
+        else if (this.accept("(")) { const a = []; while (!this.isOp(")")) { a.push(this.parseExpr()); if (!this.accept(",")) break; } this.expect(")"); dk.push(mk("ctor", a)); }
+        kids.push(mk("declarator", dk));
+      } while (this.accept(","));
+      return mk("decl", kids);
+    }
+    makeBin(op, a, b) {
+      if (op === ">") { op = "<"; [a, b] = [b, a]; } else if (op === ">=") { op = "<="; [a, b] = [b, a]; }
+      const comm = ["+", "*", "==", "!=", "&&", "||", "&", "|", "^"].includes(op);
+      if (comm && b.hash < a.hash) [a, b] = [b, a];
+      return mk("bin:" + op, [a, b]);
+    }
+    parseBinary() {
+      const vals = [], ops = [];
+      const reduce = () => { const o = ops.pop(), b = vals.pop(), a = vals.pop(); vals.push(this.makeBin(o, a, b)); };
+      vals.push(this.parseUnary());
+      while (this.cur().t === "OP" && PREC[this.cur().x] > 0) {
+        const op = this.cur().x; this.p++;
+        while (ops.length && PREC[ops[ops.length - 1]] >= PREC[op]) reduce();
+        ops.push(op); vals.push(this.parseUnary());
+      }
+      while (ops.length) reduce();
+      return vals.pop();
+    }
+    parseTernary() {
+      const c = this.parseBinary();
+      if (this.accept("?")) { const a = this.parseExpr(); this.expect(":"); const b = this.parseTernary(); return mk("?:", [c, a, b]); }
+      return c;
+    }
+    parseExpr() {
+      const l = this.parseTernary();
+      const as = ["=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="];
+      if (this.cur().t === "OP" && as.includes(this.cur().x)) {
+        const op = this.cur().x; this.p++; const r = this.parseExpr();
+        if (["+=", "-=", "*=", "/=", "%="].includes(op)) return mk("assign", [l, this.makeBin(op[0], l, r)]);
+        return mk(op === "=" ? "assign" : "assign:" + op, [l, r]);
+      }
+      return l;
+    }
+    parseUnary() {
+      const c = this.cur();
+      if (c.t === "OP" && ["!", "-", "+", "~", "*", "&", "++", "--"].includes(c.x)) { this.p++; return mk("un:" + c.x, [this.parseUnary()]); }
+      if (this.isId("new") || this.isId("delete")) this.fail("new/delete");
+      return this.parsePostfix(this.parsePrimary());
+    }
+    parsePrimary() {
+      const k = this.cur();
+      if (k.t === "NUM") { this.p++; return mk(k.x.includes(".") ? "num:float" : "num:int"); }
+      if (k.t === "STR") { this.p++; return mk("str"); }
+      if (k.t === "CHR") { this.p++; return mk("char"); }
+      if (k.t === "ID") {
+        this.p++;
+        if (k.x === "true" || k.x === "false") return mk("bool");
+        if (this.isOp("(")) return mk(STDFN.includes(k.x) ? k.x : "fn");
+        return mk(STREAM.includes(k.x) ? k.x : "var");
+      }
+      if (this.isOp("(")) {
+        const nx = this.t[this.p + 1];
+        if (nx.t === "ID" && this.isTypeName(nx.x)) { this.p++; const ty = this.parseType(); this.expect(")"); return mk("cast:" + ty.label, [this.parseUnary()]); }
+        this.p++; const e = this.parseExpr(); this.expect(")"); return e;
+      }
+      this.fail("expression");
+    }
+    parsePostfix(b) {
+      for (;;) {
+        if (this.accept("(")) { const a = [b]; while (!this.isOp(")")) { a.push(this.parseExpr()); if (!this.accept(",")) break; } this.expect(")"); b = mk("call", a); }
+        else if (this.accept("[")) { const i = this.parseExpr(); this.expect("]"); b = mk("index", [b, i]); }
+        else if (this.isOp(".") || this.isOp("->")) {
+          this.p++; if (this.cur().t !== "ID") this.fail("member");
+          const m = this.cur().x; this.p++;
+          b = mk(STDFN.includes(m) && this.isOp("(") ? "member:" + m : "member", [b]);
+        } else if (this.isOp("++") || this.isOp("--")) { b = mk("post:" + this.cur().x, [b]); this.p++; }
+        else break;
+      }
+      return b;
+    }
+    parseBlock() {
+      this.expect("{"); const k = [];
+      while (!this.isOp("}")) {
+        if (this.cur().t === "END") this.fail("missing '}'");
+        const st = this.parseStmt();
+        if (st.label === "splice") for (const c of st.kids) k.push(c); else k.push(st);
+      }
+      this.p++; return mk("block", k);
+    }
+    parseStmt() {
+      if (this.isOp("{")) return this.parseBlock();
+      if (this.accept(";")) return mk("empty");
+      if (this.isId("if")) {
+        this.p++; this.expect("("); const c = this.parseExpr(); this.expect(")"); const th = this.wrapBlock(this.parseStmt());
+        if (this.isId("else")) { this.p++; return mk("if", [c, th, this.wrapBlock(this.parseStmt())]); }
+        return mk("if", [c, th]);
+      }
+      if (this.isId("while")) { this.p++; this.expect("("); const c = this.parseExpr(); this.expect(")"); return mk("while", [c, this.wrapBlock(this.parseStmt())]); }
+      if (this.isId("do")) {
+        this.p++; const b = this.wrapBlock(this.parseStmt());
+        if (!this.isId("while")) this.fail("expected while");
+        this.p++; this.expect("("); const c = this.parseExpr(); this.expect(")"); this.expect(";"); return mk("dowhile", [b, c]);
+      }
+      if (this.isId("for")) return this.parseFor();
+      if (this.isId("return")) { this.p++; if (this.accept(";")) return mk("return"); const e = this.parseExpr(); this.expect(";"); return mk("return", [e]); }
+      if (this.isId("break")) { this.p++; this.expect(";"); return mk("break"); }
+      if (this.isId("continue")) { this.p++; this.expect(";"); return mk("continue"); }
+      if (this.isId("switch")) { this.p++; this.expect("("); const e = this.parseExpr(); this.expect(")"); return mk("switch", [e, this.parseBlock()]); }
+      if (this.isId("case")) { this.p++; const e = this.parseTernary(); this.expect(":"); return mk("case", [e]); }
+      if (this.isId("default")) { this.p++; this.expect(":"); return mk("default"); }
+      if (this.isDeclStart()) { const ty = this.parseType(); const d = this.parseDeclarators(ty); this.expect(";"); return d; }
+      const e = this.parseExpr(); this.expect(";"); return mk("expr", [e]);
+    }
+    parseFor() {
+      this.p++; this.expect("("); let init;
+      if (this.accept(";")) init = mk("empty");
+      else if (this.isDeclStart()) {
+        const ty = this.parseType();
+        if (this.cur().t === "ID" && this.t[this.p + 1].t === "OP" && this.t[this.p + 1].x === ":") {
+          this.p += 2; const r = this.parseExpr(); this.expect(")"); return mk("rangefor", [ty, r, this.wrapBlock(this.parseStmt())]);
+        }
+        init = this.parseDeclarators(ty); this.expect(";");
+      } else { init = mk("expr", [this.parseExpr()]); this.expect(";"); }
+      const cond = this.isOp(";") ? mk("bool") : this.parseExpr(); this.expect(";");
+      const incs = [];
+      if (!this.isOp(")")) { do incs.push(mk("expr", [this.parseExpr()])); while (this.accept(",")); }
+      this.expect(")");
+      const body = this.wrapBlock(this.parseStmt());
+      for (const n of incs) body.kids.push(n);
+      finalize(body);
+      return mk("splice", [init, mk("while", [cond, body])]);   // for  ==>  init; while(cond){body; incr}
+    }
+    skipToSemi() { while (!this.isOp(";") && this.cur().t !== "END") this.p++; this.p++; }
+    parseTop() {
+      if (this.isId("using")) { if (this.t[this.p + 1].t === "ID" && this.t[this.p + 2].x === "=") this.user.push(this.t[this.p + 1].x); this.skipToSemi(); return null; }
+      if (this.isId("typedef")) {
+        let q = this.p; while (!(this.t[q].x === ";" && this.t[q].t === "OP") && this.t[q].t !== "END") q++;
+        if (q > 0 && this.t[q - 1].t === "ID") this.user.push(this.t[q - 1].x);
+        this.p = q + 1; return null;
+      }
+      if (["template", "namespace", "enum", "union"].some(k => this.isId(k))) this.fail("keyword " + this.cur().x);
+      if (this.isId("struct") || this.isId("class")) {
+        this.p++; if (this.cur().t !== "ID") this.fail("struct name");
+        const nameIdx = this.p; this.user.push(this.cur().x); this.p++;
+        if (this.isOp("{")) {
+          this.p++; const m = [];
+          while (!this.isOp("}")) {
+            if (this.cur().t === "END") this.fail("missing '}'");
+            if (this.isId("public") || this.isId("private") || this.isId("protected")) { this.p++; this.expect(":"); continue; }
+            const x = this.parseTop(); if (x) m.push(x);
+          }
+          this.p++; while (!this.isOp(";") && this.cur().t !== "END") this.p++;
+          this.p++; return mk("struct", m);
+        }
+        this.p = nameIdx;
+      }
+      const ty = this.parseType(); const save = this.p;
+      if (this.cur().t !== "ID") this.fail("expected name");
+      this.p++;
+      if (this.isOp("(")) {
+        this.p++; const k = [ty];
+        while (!this.isOp(")")) {
+          const pt = this.parseType(); if (this.cur().t === "ID") this.p++;
+          while (this.accept("[")) { if (!this.isOp("]")) this.parseExpr(); this.expect("]"); }
+          if (this.accept("=")) this.parseExpr();
+          k.push(mk("param", [pt])); if (!this.accept(",")) break;
+        }
+        this.expect(")");
+        if (this.isOp("{")) k.push(this.parseBlock()); else this.expect(";");
+        return mk("func", k);
+      }
+      this.p = save; const d = this.parseDeclarators(ty); this.expect(";"); return d;
+    }
+    parseProgram() {
+      const items = [];
+      while (this.cur().t !== "END") { const x = this.parseTop(); if (x) items.push(x); }
+      return mk("program", items);
+    }
+  }
+
+  // ---------- Python: indentation tree of normalized statements ----------
+  const PY_KW = new Set("False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield".split(" "));
+  const PY_BUILTIN = new Set("print len range input int str float bool list dict set tuple sorted sum min max abs enumerate zip map filter append pop extend insert remove sort reverse split join strip lower upper open round any all isinstance type self".split(" "));
+  function pyTokens(line) {
+    const out = []; let i = 0; const n = line.length;
+    while (i < n) {
+      const c = line[i];
+      if (/\s/.test(c)) { i++; continue; }
+      if (c === "#") break;
+      if (c === '"' || c === "'") {
+        const q = line.startsWith(c.repeat(3), i) ? c.repeat(3) : c; i += q.length;
+        while (i < n && !line.startsWith(q, i)) { if (line[i] === "\\") i++; i++; }
+        i += q.length; out.push("str"); continue;
+      }
+      if (/[A-Za-z_]/.test(c)) {
+        let j = i; while (j < n && /[A-Za-z0-9_]/.test(line[j])) j++;
+        const w = line.slice(i, j); const prevDot = out[out.length - 1] === ".";
+        out.push(PY_KW.has(w) || PY_BUILTIN.has(w) ? w : (prevDot ? "attr" : "id")); i = j; continue;
+      }
+      if (/[0-9]/.test(c)) { let j = i; while (j < n && /[A-Za-z0-9._]/.test(line[j])) j++; out.push("num"); i = j; continue; }
+      const two = line.slice(i, i + 2);
+      if (["==", "!=", "<=", ">=", "+=", "-=", "*=", "/=", "//", "**", "->", ":="].includes(two)) { out.push(two); i += 2; continue; }
+      out.push(c); i++;
+    }
+    return out;
+  }
+  function parsePython(src) {
+    const root = { label: "module", kids: [], ind: -1 }; const stack = [root];
+    const lines = src.replace(/\t/g, "    ").split("\n");
+    for (const raw of lines) {
+      if (!raw.trim() || raw.trim().startsWith("#")) continue;
+      const ind = raw.length - raw.trimStart().length;
+      const toks = pyTokens(raw);
+      if (!toks.length || toks[0] === "import" || toks[0] === "from") continue;
+      while (stack.length > 1 && stack[stack.length - 1].ind >= ind) stack.pop();
+      const node = { label: "stmt:" + (PY_KW.has(toks[0]) ? toks[0] : "x"), kids: toks.map(t => ({ label: t, kids: [] })), ind };
+      stack[stack.length - 1].kids.push(node); stack.push(node);
+    }
+    const fin = n => { n.kids = n.kids.map(fin); return finalize(n); };
+    return fin(root);
+  }
+
+  // ---------- detector ----------
+  function profileOf(name, src, lang, minSize) {
+    const pr = { name, lang, total: 0, counts: new Map(), ok: false, error: "", tree: null };
+    try {
+      const tree = lang === "py" ? parsePython(src) : new CppParser(src).parseProgram();
+      const walk = n => { for (const k of n.kids) walk(k); if (n.size >= minSize) { pr.counts.set(n.hash, (pr.counts.get(n.hash) || 0) + 1); pr.total++; } };
+      walk(tree); pr.tree = tree; pr.ok = true;
+    } catch (e) { pr.error = e.message; }
+    return pr;
+  }
+  function similarity(a, b) {
+    if (a.total + b.total === 0) return 0;
+    const [sm, lg] = a.counts.size <= b.counts.size ? [a, b] : [b, a];
+    let m = 0; for (const [h, c] of sm.counts) { const o = lg.counts.get(h); if (o) m += Math.min(c, o); }
+    return 2 * m / (a.total + b.total);
+  }
+  function analyze(files, opts = {}) {
+    const minSize = opts.minSize || 4, threshold = opts.threshold ?? 0.7;
+    const profiles = files.map(f => profileOf(f.name, f.text, f.name.toLowerCase().endsWith(".py") ? "py" : "cpp", minSize));
+    const N = profiles.length, index = new Map();                      // hash table: subtree hash -> submissions
+    profiles.forEach((p, i) => { if (p.ok) for (const h of p.counts.keys()) { if (!index.has(h)) index.set(h, []); index.get(h).push(i); } });
+    const seen = new Set(), pairs = [];
+    for (const L of index.values()) for (let x = 0; x < L.length; x++) for (let y = x + 1; y < L.length; y++) {
+      if (profiles[L[x]].lang !== profiles[L[y]].lang) continue;
+      const key = L[x] * N + L[y]; if (seen.has(key)) continue; seen.add(key);
+      pairs.push({ a: L[x], b: L[y], s: similarity(profiles[L[x]], profiles[L[y]]) });
+    }
+    pairs.sort((p, q) => q.s - p.s);
+    const adj = profiles.map(() => []); for (const p of pairs) if (p.s >= threshold) { adj[p.a].push(p.b); adj[p.b].push(p.a); }
+    const vis = new Array(N).fill(false), clusters = [];
+    for (let s = 0; s < N; s++) {
+      if (vis[s]) continue; const comp = [], st = [s]; vis[s] = true;
+      while (st.length) { const u = st.pop(); comp.push(u); for (const v of adj[u]) if (!vis[v]) { vis[v] = true; st.push(v); } }
+      if (comp.length > 1) clusters.push(comp);
+    }
+    const matrix = profiles.map(() => new Array(N).fill(0)); profiles.forEach((_, i) => matrix[i][i] = 1);
+    for (const p of pairs) matrix[p.a][p.b] = matrix[p.b][p.a] = p.s;
+    return { profiles, pairs, clusters, matrix, threshold };
+  }
+  function treeText(n, depth = 0, out = [], limit = 600) {
+    if (out.length >= limit) { if (out.length === limit) out.push("  ... (truncated)"); return out; }
+    out.push("  ".repeat(depth) + n.label); for (const k of n.kids) treeText(k, depth + 1, out, limit); return out;
+  }
+
+  const api = { analyze, treeText, CppParser, parsePython };
+  if (typeof module !== "undefined" && module.exports) module.exports = api; else root.StructureCheck = api;
+})(typeof window !== "undefined" ? window : globalThis);
+
+</script>
+<script>
+let files = [];
+const $ = id => document.getElementById(id);
+const esc = s => s.replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+function addFile(name, text) { files = files.filter(f => f.name !== name); files.push({name, text}); render(); }
+$("files").onchange = async e => { for (const f of e.target.files) addFile(f.name, await f.text()); e.target.value = ""; };
+$("clear").onclick = () => { files = []; render(); };
+$("padd").onclick = () => { const t = $("ptext").value; if (!t.trim()) return; addFile($("pname").value.trim() || "pasted.cpp", t); $("ptext").value = ""; $("pname").value = "pasted" + (files.length + 1) + ".cpp"; };
+$("th").oninput = () => { $("thv").textContent = $("th").value + "%"; render(); };
+$("ms").oninput = render;
+
+function colorFor(s) { const a = Math.min(1, s); return `rgba(217,59,59,${(a * a * 0.85).toFixed(2)})`; }
+
+function render() {
+  $("chips").innerHTML = files.map((f, i) => `<span class="chip">${esc(f.name)}<b data-i="${i}" title="remove">×</b></span>`).join("");
+  document.querySelectorAll(".chip b").forEach(b => b.onclick = () => { files.splice(+b.dataset.i, 1); render(); });
+  if (files.length < 2) { $("out").hidden = true; $("astcard").hidden = files.length === 0; if (files.length) fillAst(null); return; }
+  const th = +$("th").value / 100, r = StructureCheck.analyze(files, {threshold: th, minSize: +$("ms").value || 4});
+  $("out").hidden = false;
+  const bad = r.profiles.filter(p => !p.ok);
+  $("errs").innerHTML = bad.map(p => `<div class="err">⚠ ${esc(p.name)} skipped: ${esc(p.error)}</div>`).join("");
+  const P = r.profiles, N = P.length;
+  let h = "<table><tr><th></th>" + P.map(p => `<th>${esc(p.name)}</th>`).join("") + "</tr>";
+  for (let i = 0; i < N; i++) { h += `<tr><th>${esc(P[i].name)}</th>`; for (let j = 0; j < N; j++) { const s = r.matrix[i][j]; h += `<td style="background:${colorFor(s)};color:${s > .5 ? "#fff" : "inherit"}">${i === j ? "–" : Math.round(s * 100) + "%"}</td>`; } h += "</tr>"; }
+  $("heat").innerHTML = h + "</table>";
+  const top = r.pairs.slice(0, 15);
+  $("pairs").innerHTML = top.length ? "<table><tr><th>File A</th><th>File B</th><th>Similarity</th><th></th></tr>" + top.map(p =>
+    `<tr><td>${esc(P[p.a].name)}</td><td>${esc(P[p.b].name)}</td><td class="${p.s >= th ? "flag" : ""}">${(p.s * 100).toFixed(1)}%${p.s >= th ? " ⚑" : ""}</td><td><div class="barbg"><div class="bar" style="width:${(p.s * 100).toFixed(0)}%"></div></div></td></tr>`).join("") + "</table>" : "<span class='muted'>No similar pairs.</span>";
+  drawGraph(r);
+  $("clist").textContent = r.clusters.length ? r.clusters.map((c, k) => `Cluster ${k + 1}: ` + c.map(i => P[i].name).join(", ")).join("   |   ") : "No cluster above the threshold.";
+  fillAst(r);
+}
+
+function drawGraph(r) {
+  const P = r.profiles, N = P.length, W = 560, H = 360, cx = W / 2, cy = H / 2, R = Math.min(W, H) / 2 - 50;
+  const pos = P.map((_, i) => [cx + R * Math.cos(2 * Math.PI * i / N - Math.PI / 2), cy + R * Math.sin(2 * Math.PI * i / N - Math.PI / 2)]);
+  const colors = ["#d93b3b", "#2f6fed", "#e0a100", "#1a9e6b", "#a14bd1", "#e0629a"], cl = new Array(N).fill(-1);
+  r.clusters.forEach((c, k) => c.forEach(i => cl[i] = k));
+  let s = `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px">`;
+  for (const p of r.pairs) if (p.s >= r.threshold) s += `<line x1="${pos[p.a][0]}" y1="${pos[p.a][1]}" x2="${pos[p.b][0]}" y2="${pos[p.b][1]}" stroke="#d93b3b" stroke-width="${1 + 4 * p.s}" opacity=".7"><title>${(p.s * 100).toFixed(1)}%</title></line>`;
+  P.forEach((p, i) => { s += `<circle cx="${pos[i][0]}" cy="${pos[i][1]}" r="14" fill="${cl[i] < 0 ? "#8a97a8" : colors[cl[i] % colors.length]}"/><text x="${pos[i][0]}" y="${pos[i][1] + 28}" text-anchor="middle">${esc(p.name)}</text>`; });
+  $("graph").innerHTML = s + "</svg>";
+}
+
+function fillAst(r) {
+  $("astcard").hidden = false;
+  const sel = $("astsel"), prev = sel.value;
+  sel.innerHTML = files.map(f => `<option>${esc(f.name)}</option>`).join(""); if (files.some(f => f.name === prev)) sel.value = prev;
+  const show = () => {
+    const f = files.find(x => x.name === sel.value); if (!f) return;
+    const pr = r ? r.profiles.find(p => p.name === f.name) : StructureCheck.analyze([f, f], {}).profiles[0];
+    $("ast").textContent = pr.ok ? StructureCheck.treeText(pr.tree).join("\n") : "Unsupported: " + pr.error;
+  };
+  sel.onchange = show; show();
+}
+render();
+</script>
+</body>
+</html>
